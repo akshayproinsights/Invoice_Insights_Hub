@@ -1,0 +1,39 @@
+# ===========================================================
+# STREAMLIT APP REQUIREMENTS
+# ===========================================================
+
+# Streamlit framework
+streamlit==1.31.0
+
+# Google Cloud services
+google-cloud-storage==2.14.0
+google-cloud-bigquery==3.14.0
+google-auth==2.27.0
+google-auth-oauthlib==1.2.0
+
+# Gemini API
+google-generativeai==0.3.2
+
+# Google Sheets
+gspread==5.12.0
+gspread-dataframe==3.3.1
+
+# Data processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Image processing
+Pillow==10.1.0
+
+# Excel support
+openpyxl==3.1.2
+xlsxwriter==3.1.9
+
+# Configuration
+pyyaml==6.0.1
+
+# Utilities
+python-dotenv==1.0.0
+
+# Optional: For local development
+# watchdog==3.0.0  # Auto-reload
