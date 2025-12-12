@@ -9,7 +9,7 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Fix Windows encoding issues (Clean re-type)
+# Fix Windows encoding issues
 import io
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -46,7 +46,7 @@ Your task is to extract data into a specific JSON structure.
 
 **STEP 1: Extract Header Information** (Applies to the whole bill)
 * **Receipt Number:** Look for red text (e.g., 1, 15, 150). Check and capture the number ensuring it is **always 3 digits** (e.g., 1 -> 001, 15 -> 015, 150 -> 150).
-* **Date:** Format 'dd-mm-yyyy'. The year must be **2024 or 2025**. If the handwritten year is prior to 2024 (e.g., '23, 2023, '22), **do not consider that date**. Convert two-digit years like '25' to '2025' (e.g., 25-05-2025).
+* **Date:** Format 'dd-mm-yyyy'. The year must be **2025,2026**. If the handwritten year is prior to 2025 (e.g., '23, 2023, '22), **do not consider that date**. Convert two-digit years like '25' to '2025' (e.g., 25-05-2025).
 * **Customer Name:** Extract the name (e.g., Shri Ganesh...). The name **must be in English** and contain **name only** (exclude salutations like 'Shri', 'Mr.', or 'Sir').
 * **Mobile Number:** Extract phone number.
 * **Car Number:** Extract vehicle number (e.g., MH 12...). The number **should be standard** and **must not have decimal places**.
@@ -108,10 +108,12 @@ def robust_rmtree(path):
             pass
 
 # =================================
-# DATE NORMALIZATION
+# DATE FORMATTING HELPERS
 # =================================
 def normalize_date(date_str: str) -> str:
-    """Normalizes date string to DD-MM-YYYY format, validating against 2024/2025 rule."""
+    """
+    Normalizes input to strict DD-MM-YYYY format.
+    """
     if not date_str or not date_str.strip():
         return ""
     s = date_str.strip().replace('/', '-')
@@ -136,23 +138,44 @@ def normalize_date(date_str: str) -> str:
         month = int(m)
         year = int(y)
         
-        # Validation: Must be a plausible date and year 2024 or 2025
         if not (1 <= day <= 31 and 1 <= month <= 12 and 2000 <= year <= 2100):
             return ""
         
-        if year not in [2024, 2025]:
-            return "" # Enforce the specific year rule
+        if year not in [2025, 2026]:
+            return "" 
         
-        # Output format is DD-MM-YYYY
         return f"{day:02d}-{month:02d}-{year}"
     except:
         return ""
+
+def format_to_mmm(date_str: str) -> str:
+    """
+    Input: dd-mm-yyyy (12-12-2025)
+    Output: dd-mmm-yyyy (12-Dec-2025)
+    """
+    if not date_str: return ""
+    try:
+        dt = datetime.strptime(date_str, "%d-%m-%Y")
+        return dt.strftime("%d-%b-%Y")
+    except:
+        return date_str
+
+def format_to_us(date_str: str) -> str:
+    """
+    Input: dd-mm-yyyy (12-12-2025)
+    Output: mm/dd/yyyy (12/12/2025)
+    """
+    if not date_str: return ""
+    try:
+        dt = datetime.strptime(date_str, "%d-%m-%Y")
+        return dt.strftime("%m/%d/%Y")
+    except:
+        return date_str
 
 # =================================
 # CLIENT INITIALIZATION
 # =================================
 def get_storage_client():
-    """Initializes and returns the R2 storage client."""
     try:
         config_json = os.environ.get('R2_CONFIG_JSON')
         if not config_json: return None
@@ -171,7 +194,6 @@ def get_storage_client():
         return None
 
 def get_google_creds():
-    """Reads and returns Google service account credentials."""
     try:
         sa_json = os.environ.get('GCP_SA_JSON')
         if not sa_json: return None
@@ -180,7 +202,6 @@ def get_google_creds():
         return None
 
 def configure_ai():
-    """Configures the Gemini API client."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key: return False
     genai.configure(api_key=api_key)
@@ -190,7 +211,6 @@ def configure_ai():
 # SHEET HELPERS
 # =================================
 def connect_to_sheets(sheet_id: str, credentials) -> Dict[str, Any]:
-    """Connects to Google Sheets and ensures required worksheets exist with correct headers."""
     try:
         gc = gspread.authorize(credentials)
         spreadsheet = gc.open_by_key(sheet_id)
@@ -214,13 +234,12 @@ def connect_to_sheets(sheet_id: str, credentials) -> Dict[str, Any]:
         
         # 3. Verify Amount
         HEADERS_VERIFY_AMOUNT = [
-            "Verification Status", "Receipt Number", "Description", "Quantity", "Rate", "Amount", "Difference", "Receipt Link", "Upload Date"
+            "Verification Status", "Receipt Number", "Description", "Amount", "Difference", "Receipt Link", "Upload Date"
         ]
 
         sheets = {}
 
         def setup_worksheet(title, headers, rows_min=1000):
-            """Ensures a worksheet exists and has the correct headers."""
             try:
                 ws = spreadsheet.worksheet(title)
             except WorksheetNotFound:
@@ -250,180 +269,131 @@ def connect_to_sheets(sheet_id: str, credentials) -> Dict[str, Any]:
         return None
 
 # =================================
-# CLEANUP AND SORT FUNCTION (UPDATED)
+# NEW VERIFICATION LOGIC
 # =================================
-def clean_and_sort_sheet(ws_report):
+def run_verification_logic(ws_all, ws_verify):
     """
-    Post-processing for 'Verify Dates and Receipt Numbers':
-    1. Reads the sheet.
-    2. Sorts by 'Receipt Number' DESCENDING.
-    3. Drops duplicates (subset=['Receipt Number', 'Date', 'Receipt Link']).
-    4. Highlights the header row (Standard Yellow).
-    5. Rewrites the clean data.
+    Reads 'Invoice All', applies strict logic to find date/receipt anomalies,
+    and completely refreshes 'Verify Dates and Receipt Numbers' sheet.
     """
     if not HAS_GSPREAD_DF:
-        print("Skipping clean_and_sort: gspread_dataframe missing.")
+        print("Skipping verification logic: gspread_dataframe missing.")
         return
 
-    print("Running Post-Processing: Clean, Sort (Desc), and Format Verify Sheet...")
+    print("Running Verification Logic on Dates & Receipts...")
     try:
-        # 1. Read Data
-        df = get_as_dataframe(ws_report, header=0)
+        # Read Data from Invoice All
+        df = get_as_dataframe(ws_all, header=0)
         
-        # Basic cleanup: Drop fully empty rows
-        df.dropna(how='all', inplace=True)
-        if df.empty:
-            print("Verify sheet is empty, skipping sort.")
+        if df.empty or 'Receipt Number' not in df.columns or 'Date' not in df.columns:
+            print("Invoice All sheet is empty or missing columns. Skipping verification.")
             return
 
-        # 2. Sort by Receipt Number DESCENDING
-        # Convert Receipt Number to numeric for sorting purposes only
-        df['temp_sort_num'] = pd.to_numeric(df['Receipt Number'], errors='coerce')
-        # Sort by Receipt Number (Desc)
-        df = df.sort_values(by=['temp_sort_num'], ascending=False)
-        # Remove the temp column
-        df.drop(columns=['temp_sort_num'], inplace=True)
+        # ---------------------------
+        # 0. Input: original df
+        # ---------------------------
+        df = df.copy()
 
-        # 3. Drop Duplicates
-        # Using the requested subset logic
-        df.drop_duplicates(subset=['Receipt Number', 'Date', 'Receipt Link'], keep='first', inplace=True)
-
-        # 4. Rewrite Data
-        ws_report.clear()
-        set_with_dataframe(ws_report, df, include_index=False, include_column_header=True)
-
-        # 5. Highlight Header Row (Standard Yellow #FFFF00)
-        num_cols = len(df.columns)
-        header_range = f"A1:{rowcol_to_a1(1, num_cols)}"
+        # ---------------------------
+        # 1. Normalize fields
+        # ---------------------------
+        # Ensure Receipt Number is string and stripped
+        df['Receipt Number'] = df['Receipt Number'].astype(str).str.strip()
+        df['Receipt Link']   = df['Receipt Link'].astype(str).str.strip()
         
-        ws_report.format(header_range, {
-            "backgroundColor": {
-                "red": 1.0,
-                "green": 1.0,
-                "blue": 0.0
-            },
-            "textFormat": {
-                "bold": True
-            }
-        })
-        print("Verify Sheet sorted (desc), de-duped, and headers highlighted.")
+        # Parse Date - Handle potential formats from Invoice All
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
 
-    except Exception as e:
-        print(f"Error in clean_and_sort_sheet: {e}")
+        # ---------------------------
+        # 2. Remove exact duplicates
+        # ---------------------------
+        df = df.drop_duplicates(subset=['Receipt Number', 'Receipt Link', 'Date'], keep='first')
 
-# =================================
-# POST-PROCESSING: DATE & RECEIPT ANALYSIS
-# =================================
-def update_date_receipt_report(ws_all, ws_report):
-    """
-    Reads Invoice All, performs anomaly detection.
-    Appends ONLY NEW, unverified anomalies.
-    """
-    if not HAS_GSPREAD_DF:
-        return
+        # ---------------------------
+        # 3. Collapse to ONE row per (Receipt Number, Receipt Link)
+        # ---------------------------
+        df_sorted = df.sort_values(['Receipt Number', 'Receipt Link', 'Date'], kind='stable')
+        df_final = df_sorted.groupby(['Receipt Number', 'Receipt Link'], as_index=False).first()
 
-    print("Syncing Date & Receipt Anomaly Report (Append Mode)...")
-    try:
-        # 1. Read 'Invoice All'
-        df = get_as_dataframe(ws_all, header=0, usecols=['Receipt Number', 'Date', 'Receipt Link', 'Upload Date'])
-        
-        df.columns = df.columns.str.strip()
-        df.dropna(subset=['Receipt Number'], inplace=True) 
-        df['Receipt_Num_Int'] = pd.to_numeric(df['Receipt Number'], errors='coerce')
-        df.dropna(subset=['Receipt_Num_Int'], inplace=True)
-        df['Date_dt'] = pd.to_datetime(df['Date'], format='%d-%m-%Y', errors='coerce') 
+        # ---------------------------
+        # 4. Sort for date diff logic
+        # ---------------------------
+        df_final = df_final.sort_values(['Receipt Number', 'Date'], kind='stable').reset_index(drop=True)
 
-        df_sorted = df.sort_values(by='Receipt_Num_Int', ascending=True).reset_index(drop=True)
-        
-        if df_sorted.empty: return
+        # ---------------------------
+        # 5. Compute Date Difference
+        # ---------------------------
+        prev = df_final['Date'].where(df_final['Date'].notna()).ffill().shift()
+        df_final['Date_Diff_days'] = (df_final['Date'] - prev).dt.days
 
-        # --- Anomaly Calculation ---
-        receipt_diff = df_sorted['Receipt_Num_Int'].diff().fillna(0).astype(int)
-        
-        def get_receipt_error(diff, index):
-            if index == 0: return ''
-            if diff == 1: return ''
-            if diff == 0: return 'Duplicate Receipt Number'
-            if diff > 1: return f'Receipt Gap: {diff}'
-            return 'Receipt Sequence Error'
+        def fmt_diff(x):
+            if pd.isna(x) or x <= 1:
+                return ""
+            return f"Date Diff: {int(x)}"
 
-        df_sorted['TEMP_RECEIPT_ERR'] = [get_receipt_error(diff, i) for i, diff in enumerate(receipt_diff)]
+        df_final['Date_Diff'] = df_final['Date_Diff_days'].apply(fmt_diff)
 
-        prev_valid_date = df_sorted['Date_dt'].ffill().shift(1)
-        backward_diff_days = (df_sorted['Date_dt'] - prev_valid_date).dt.days
+        df_final['Date_Missing_Comment'] = np.where(df_final['Date'].isna(), 'Missing Date', '')
 
-        df_sorted['TEMP_DATE_ERR'] = ''
-        df_sorted.loc[df_sorted['Date_dt'].isna(), 'TEMP_DATE_ERR'] = 'Missing Date'
-        
-        mask_anomaly = (df_sorted['Date_dt'].notna()) & ((backward_diff_days < 0) | (backward_diff_days > 3))
-        df_sorted.loc[mask_anomaly & (df_sorted['TEMP_DATE_ERR'] == ''), 'TEMP_DATE_ERR'] = (
-            'Date Diff: ' + backward_diff_days.loc[mask_anomaly].astype(int).astype(str)
-        )
+        # ---------------------------
+        # 6. Duplicate checks after grouping
+        # ---------------------------
+        df_final['Duplicate_Receipt_Final'] = df_final['Receipt Number'].duplicated(keep=False)
+        df_final['Duplicate_Link_Final']    = df_final['Receipt Link'].duplicated(keep=False)
 
-        df_sorted['Anomaly_Reason'] = df_sorted.apply(
-            lambda row: ' | '.join(filter(None, [row['TEMP_RECEIPT_ERR'], str(row['TEMP_DATE_ERR'])])), axis=1
-        )
-        
-        df_anomalies = df_sorted[df_sorted['Anomaly_Reason'].str.len() > 0].copy()
-        
-        if df_anomalies.empty: return
+        # ---------------------------
+        # 7. Build Audit Finding
+        # ---------------------------
+        def build_audit(row):
+            parts = []
+            if row['Date_Diff']:
+                parts.append(row['Date_Diff'])
+            if row['Date_Missing_Comment']:
+                parts.append(row['Date_Missing_Comment'])
+            if row['Duplicate_Receipt_Final']:
+                parts.append("Duplicate Receipt Number")
+            if row['Duplicate_Link_Final']:
+                parts.append("Duplicate Receipt Link")
+            return " | ".join(parts) if parts else ""
 
-        # Consolidate findings
-        df_consolidated = df_anomalies.groupby(['Receipt Number', 'Receipt Link']).agg(
-            Audit_Finding=('Anomaly_Reason', lambda x: ' | '.join(sorted(set(y for y in x if y)))),
-            Date=('Date', 'first'),
-            Upload_Date=('Upload Date', 'first')
-        ).reset_index()
-        
-        df_consolidated = df_consolidated[df_consolidated['Audit_Finding'].str.len() > 0].copy()
+        df_final['Audit Finding'] = df_final.apply(build_audit, axis=1)
 
-        # 2. Read Existing Report
-        try:
-            df_existing = get_as_dataframe(ws_report, header=0)
-            if 'Receipt Number' not in df_existing.columns: df_existing['Receipt Number'] = ""
-            if 'Audit Finding' not in df_existing.columns: df_existing['Audit Finding'] = ""
-            
-            existing_keys = set(zip(
-                df_existing['Receipt Number'].astype(str), 
-                df_existing['Audit Finding'].astype(str)
-            ))
-        except Exception:
-            existing_keys = set()
+        # ---------------------------
+        # 8. Filter only rows with findings
+        # ---------------------------
+        output = df_final[df_final['Audit Finding'].astype(bool)].copy()
 
-        # 3. Filter for NEW anomalies
-        new_rows = []
-        # Use IST for formatted current date (dd-mm-yyyy) as requested for Upload Date
-        current_date_str = datetime.now(IST).strftime("%d-%m-%Y")
+        # ---------------------------
+        # 9. Add required columns
+        # ---------------------------
+        output['Verification Status'] = "Pending"
+        output['Upload Date'] = datetime.now(IST).strftime("%d-%b-%Y")
 
-        for _, row in df_consolidated.iterrows():
-            r_num = str(row['Receipt Number'])
-            reason = str(row['Audit_Finding'])
-            
-            if (r_num, reason) not in existing_keys:
-                u_date = row.get('Upload Date', current_date_str)
+        # Convert Date to dd-mm-yyyy (Indian Format)
+        output['Date'] = output['Date'].dt.strftime("%d-%m-%Y")
 
-                new_rows.append({
-                    "Verification Status": "Pending",
-                    "Receipt Number": row['Receipt Number'],
-                    "Date": row['Date'],
-                    "Receipt Link": row['Receipt Link'],
-                    "Audit Finding": row['Audit_Finding'],
-                    "Upload Date": u_date
-                })
+        # ---------------------------
+        # 10. Final column order
+        # ---------------------------
+        output = output[
+            ["Verification Status", "Receipt Number", "Date",
+             "Receipt Link", "Audit Finding", "Upload Date"]
+        ].reset_index(drop=True)
 
-        # 4. Append New Rows
-        if new_rows:
-            df_new = pd.DataFrame(new_rows)
-            df_new.drop_duplicates(subset=['Receipt Number', 'Audit Finding'], inplace=True)
-            
-            start_row = ws_report.row_count + 1 if ws_report.row_count > 0 else 2 
-            set_with_dataframe(ws_report, df_new, include_index=False, include_column_header=False, row=start_row)
-            print(f"Appended {len(df_new)} new anomalies.")
+        # Write to Google Sheet (Clear and Rewrite)
+        if not output.empty:
+            ws_verify.clear()
+            set_with_dataframe(ws_verify, output, include_index=False, include_column_header=True)
+            print(f"Verification Sheet updated with {len(output)} anomalies.")
         else:
-            print("No new anomalies to append.")
+            print("No anomalies found. Verification Sheet cleared.")
+            ws_verify.clear()
+            # Restore header if empty
+            headers = ["Verification Status", "Receipt Number", "Date", "Receipt Link", "Audit Finding", "Upload Date"]
+            ws_verify.append_row(headers)
 
     except Exception as e:
-        print(f"Error syncing anomaly report: {e}")
+        print(f"Error running verification logic: {e}")
 
 # =================================
 # PROCESSING LOGIC
@@ -433,8 +403,10 @@ def process_single_image(storage_client, bucket_name, key, temp_dir):
     filename = key.split("/")[-1]
     local_path = os.path.join(temp_dir, filename)
     receipt_link = ""
-    # Upload Date formatted as dd-mm-yyyy in IST
-    upload_date = datetime.now(IST).strftime("%d-%m-%Y")
+    
+    # Upload Date formatted as dd-MMM-yyyy (e.g., 12-Dec-2025)
+    upload_date_iso = datetime.now(IST)
+    upload_date_mmm = upload_date_iso.strftime("%d-%b-%Y")
 
     try:
         r2_config_json = os.environ.get('R2_CONFIG_JSON')
@@ -487,8 +459,12 @@ def process_single_image(storage_client, bucket_name, key, temp_dir):
             try: return func(val) if val not in [None, ""] else ""
             except: return ""
 
-        # Normalize Date to dd-mm-yyyy
-        rec_date_normalized = normalize_date(header.get("date", ""))
+        # 1. Base Extraction is dd-mm-yyyy
+        rec_date_base = normalize_date(header.get("date", ""))
+        
+        # 2. Transformations for specific sheets
+        rec_date_mmm = format_to_mmm(rec_date_base) # 12-Dec-2025
+        rec_date_us = format_to_us(rec_date_base)   # 12/12/2025
 
         for item in items:
             qty = safe_num(item.get("quantity"), float)
@@ -516,14 +492,14 @@ def process_single_image(storage_client, bucket_name, key, temp_dir):
                 rec_num = rec_num
 
             if not rec_num or len(rec_num) != 3 or not rec_num.isdigit(): review_reasons.append("Review Receipt Number")
-            if not rec_date_normalized: review_reasons.append("Review Date")
+            if not rec_date_base: review_reasons.append("Review Date")
             if isinstance(difference, (int, float)) and difference > 0: review_reasons.append("Review Price")
 
             review_status = ", ".join(review_reasons) if review_reasons else "Not Required"
 
             row = {
                 "Receipt Number": rec_num or "",
-                "Date": rec_date_normalized or "", # Formatted dd-mm-yyyy
+                "Date": rec_date_mmm or "", # Invoice All: dd-mmm-yyyy
                 "Customer Name": header.get("customer_name", "") or "",
                 "Mobile Number": header.get("mobile_number", "") or "",
                 "Car Number": header.get("car_number", "") or "",
@@ -540,9 +516,9 @@ def process_single_image(storage_client, bucket_name, key, temp_dir):
                 "Accuracy %": safe_num(item.get("confidence"), int),
                 "Receipt Link": receipt_link,
                 "Source File": filename,
-                "Upload Date": upload_date, # Formatted dd-mm-yyyy (IST)
+                "Upload Date": upload_date_mmm, # Invoice All: dd-mmm-yyyy
                 "_r2_key": key,
-                "Date_Eng": rec_date_normalized or ""
+                "Date_Eng": rec_date_us or ""   # Invoice All: mm/dd/yyyy
             }
             rows.append(row)
             
@@ -570,7 +546,6 @@ def update_google_sheet(worksheet, new_records: List[Dict[str, Any]], headers: L
     if not new_records: return
     try:
         rows = [[str(rec.get(h, "")) for h in headers] for rec in new_records]
-        start_row = worksheet.row_count + 1 if worksheet.row_count > 0 else 2
         worksheet.append_rows(rows, value_input_option='USER_ENTERED')
         print(f"Added {len(rows)} rows to '{worksheet.title}'")
     except Exception as e:
@@ -670,7 +645,7 @@ def main():
                                     "Amount": r.get("Amount"),
                                     "Difference": diff,
                                     "Receipt Link": r.get("Receipt Link"),
-                                    "Upload Date": r.get("Upload Date")
+                                    "Upload Date": r.get("Upload Date") 
                                 })
                         update_google_sheet(sheets['verify_amount'], amount_rows, headers_amount)
                         
@@ -706,11 +681,9 @@ def main():
         write_progress("Finalizing Reports", "cleanup")
         robust_rmtree(TEMP_DOWNLOAD_DIR)
     
-    # --- SYNC ANOMALY REPORT (Append) ---
-    update_date_receipt_report(sheets['all'], sheets['verify_dates'])
-
-    # --- CLEAN, SORT, AND FORMAT VERIFY SHEET (New Last Step) ---
-    clean_and_sort_sheet(sheets['verify_dates'])
+    # --- RUN NEW VERIFICATION LOGIC ---
+    # This reads Invoice All, calculates anomalies based on your logic, and overwrites the Verify sheet
+    run_verification_logic(sheets['all'], sheets['verify_dates'])
 
     print("--- Processing Complete ---")
 
