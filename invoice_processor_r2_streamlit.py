@@ -234,7 +234,7 @@ def connect_to_sheets(sheet_id: str, credentials) -> Dict[str, Any]:
         
         # 3. Verify Amount
         HEADERS_VERIFY_AMOUNT = [
-            "Verification Status", "Receipt Number", "Description", "Amount", "Difference", "Receipt Link", "Upload Date"
+            "Verification Status", "Receipt Number", "Description","Quantity", "Rate", "Amount", "Difference", "Receipt Link", "Upload Date"
         ]
 
         sheets = {}
@@ -327,9 +327,13 @@ def run_verification_logic(ws_all, ws_verify):
         df_final['Date_Diff_days'] = (df_final['Date'] - prev).dt.days
 
         def fmt_diff(x):
-            if pd.isna(x) or x <= 1:
+            if pd.isna(x):
                 return ""
-            return f"Date Diff: {int(x)}"
+            if x > 1:
+                return f"Date Diff: {int(x)}"
+            if x < -1:
+                return f"Date Diff: {int(abs(x))}"
+            return ""
 
         df_final['Date_Diff'] = df_final['Date_Diff_days'].apply(fmt_diff)
 
